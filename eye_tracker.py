@@ -5,6 +5,12 @@ from scipy.ndimage import gaussian_filter
 import time
 from threading import Thread
 from queue import Queue
+from tracker import EyeTracker
+from video_stream import WebcamVideoStream
+from visualization import draw_gaze_point, draw_heatmap, draw_status, draw_calibration_grid
+from utils import create_output_dir, save_processed_image, get_image_files, load_image, resize_image
+import os
+import sys
 
 face_cascade = cv2.CascadeClassifier('haarcascade_frontalface_default.xml')
 eye_cascade = cv2.CascadeClassifier('haarcascade_eye.xml')
@@ -28,6 +34,29 @@ CALIBRATION_POINTS = [
     (0, 1080),        # Bottom-left
     (960, 540)        # Center point for better accuracy
 ]
+
+# Check if we're in a GUI environment
+def check_display():
+    try:
+        # Try to create a test window
+        test_window = cv2.namedWindow('test', cv2.WINDOW_NORMAL)
+        cv2.destroyWindow('test')
+        return True
+    except:
+        return False
+
+# Global display flag
+HAS_DISPLAY = check_display()
+
+def show_frame(title, frame):
+    """Safely show a frame, with fallback for non-GUI environments"""
+    if HAS_DISPLAY:
+        cv2.imshow(title, frame)
+    else:
+        print(f"Warning: Cannot display window '{title}'. No GUI environment detected.")
+        # Save frame to file instead
+        output_dir = create_output_dir()
+        save_processed_image(frame, output_dir)
 
 class WebcamVideoStream:
     def __init__(self, src=0):
@@ -325,14 +354,184 @@ def generate_heatmap(gaze_points, screen_width, screen_height):
     plt.gca().invert_yaxis()  # Optional, depending on your coordinate system
     plt.show()
 
-def main():
-    """Enhanced main function with better error handling and visualization"""
+def process_static_images():
+    """Process static images from directory"""
+    print("\nStatic image testing not implemented yet.")
+    return
+
+def live_tracking():
+    """Live eye tracking with webcam"""
+    # Initialize video stream
     cap = WebcamVideoStream(0).start()
-    gaze_points = []
-    screen_width, screen_height = 1920, 1080
-    calibration_data = None
-    debug_mode = False
+    time.sleep(1.0)  # Give camera time to initialize
     
+    # Get webcam dimensions
+    frame = cap.read()
+    if frame is None:
+        print("Error: Could not initialize webcam")
+        return
+    screen_height, screen_width = frame.shape[:2]
+    
+    # Initialize tracker
+    tracker = EyeTracker()
+    gaze_points = []
+    calibration_data = None
+    debug_mode = True  # Start with debug mode on
+    
+    try:
+        # Calibration phase
+        print("\n=== Starting Calibration ===")
+        print("Look at each green dot in sequence when prompted.")
+        print("Press 'Space' when you're looking at the dot.")
+        print("Press 'q' to quit calibration.\n")
+        
+        for i, point in enumerate(tracker.CALIBRATION_POINTS):
+            print(f"\nLook at the green dot in the {['top-left', 'top-right', 'bottom-right', 'bottom-left', 'center'][i]} corner.")
+            print("Press 'Space' when ready, then look at the dot for 2 seconds.")
+            
+            # Scale calibration point to webcam dimensions
+            scaled_point = (
+                int(point[0] * screen_width / 1920),
+                int(point[1] * screen_height / 1080)
+            )
+            
+            # Show calibration screen
+            calibration_screen = np.ones((screen_height, screen_width, 3), dtype=np.uint8) * 255
+            calibration_screen = draw_calibration_grid(calibration_screen, screen_width, screen_height)
+            
+            # Wait for space key
+            while True:
+                frame = cap.read()
+                if frame is None:
+                    continue
+                
+                # Debug visualization
+                debug_frame = frame.copy()
+                faces = tracker.detect_faces(debug_frame)
+                for (x, y, w, h) in faces:
+                    # Draw face rectangle
+                    cv2.rectangle(debug_frame, (x, y), (x+w, y+h), (255, 0, 0), 2)
+                    face_roi = debug_frame[y:y+h, x:x+w]
+                    
+                    # Detect and draw eyes
+                    eyes = tracker.detect_eyes(face_roi)
+                    for (ex, ey, ew, eh) in eyes:
+                        cv2.rectangle(face_roi, (ex, ey), (ex+ew, ey+eh), (0, 255, 0), 2)
+                
+                # Show debug info
+                cv2.putText(debug_frame, "Face and eye detection", (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                
+                # Show live feed with calibration screen overlay
+                overlay = debug_frame.copy()
+                cv2.addWeighted(calibration_screen, 0.3, overlay, 0.7, 0, overlay)
+                cv2.imshow('Calibration', overlay)
+                
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord(' '):
+                    break
+                elif key == ord('q'):
+                    cv2.destroyAllWindows()
+                    cap.stop()
+                    return
+            
+            # Collect gaze samples for 2 seconds
+            samples = []
+            start_time = time.time()
+            while time.time() - start_time < 2:
+                frame = cap.read()
+                if frame is None:
+                    continue
+                
+                # Debug visualization
+                debug_frame = frame.copy()
+                faces = tracker.detect_faces(debug_frame)
+                for (x, y, w, h) in faces:
+                    cv2.rectangle(debug_frame, (x, y), (x+w, y+h), (255, 0, 0), 2)
+                    face_roi = debug_frame[y:y+h, x:x+w]
+                    eyes = tracker.detect_eyes(face_roi)
+                    for (ex, ey, ew, eh) in eyes:
+                        cv2.rectangle(face_roi, (ex, ey), (ex+ew, ey+eh), (0, 255, 0), 2)
+                
+                if tracker.calibrate(frame, scaled_point):
+                    samples.append(scaled_point)
+                    cv2.putText(debug_frame, "Gaze point recorded!", (10, 60),
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                
+                # Show live feed with calibration screen overlay
+                overlay = debug_frame.copy()
+                cv2.addWeighted(calibration_screen, 0.3, overlay, 0.7, 0, overlay)
+                cv2.imshow('Calibration', overlay)
+                cv2.waitKey(1)
+            
+            if samples:
+                print(f"Calibration point {i+1} recorded successfully!")
+            else:
+                print(f"Warning: No valid samples collected for point {i+1}")
+        
+        cv2.destroyAllWindows()
+        
+        # Live tracking phase
+        print("\nCalibration complete! Starting live tracking...")
+        print("\nControls:")
+        print("D: Toggle debug visualization")
+        print("H: Show heatmap")
+        print("Q: Quit")
+        
+        while True:
+            frame = cap.read()
+            if frame is None:
+                continue
+            
+            # Get gaze point
+            gaze_point = tracker.estimate_gaze(frame)
+            if gaze_point:
+                gaze_points.append(gaze_point)
+            
+            # Create visualization frame
+            if debug_mode:
+                frame_to_show = frame.copy()
+                faces = tracker.detect_faces(frame_to_show)
+                for (x, y, w, h) in faces:
+                    cv2.rectangle(frame_to_show, (x, y), (x+w, y+h), (255, 0, 0), 2)
+                    face_roi = frame_to_show[y:y+h, x:x+w]
+                    eyes = tracker.detect_eyes(face_roi)
+                    for (ex, ey, ew, eh) in eyes:
+                        cv2.rectangle(face_roi, (ex, ey), (ex+ew, ey+eh), (0, 255, 0), 2)
+                cv2.putText(frame_to_show, "Debug Mode", (10, 30),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            else:
+                frame_to_show = frame.copy()
+            
+            # Draw gaze point
+            if gaze_point:
+                frame_to_show = draw_gaze_point(frame_to_show, gaze_point)
+            
+            # Show frame
+            cv2.imshow('Eye Tracking', frame_to_show)
+            
+            # Handle key presses
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('d'):
+                debug_mode = not debug_mode
+            elif key == ord('h') and gaze_points:
+                draw_heatmap(gaze_points, screen_width, screen_height)
+    
+    except KeyboardInterrupt:
+        print("\nTracking interrupted by user.")
+    finally:
+        # Cleanup
+        cap.stop()
+        cv2.destroyAllWindows()
+        
+        if gaze_points:
+            print("\nGenerating final heatmap...")
+            draw_heatmap(gaze_points, screen_width, screen_height)
+
+def main():
+    """Main entry point"""
     print("\nEye Tracking System")
     print("==================")
     print("1: Start Live Tracking")
@@ -342,65 +541,13 @@ def main():
     choice = input("\nEnter your choice: ").strip().lower()
     
     if choice == '1':
-        print("\nStarting calibration process...")
-        calibration_data = calibrate(cap, screen_width, screen_height)
-        
-        if calibration_data:
-            print("\nCalibration successful! Starting live tracking...")
-            print("\nControls:")
-            print("D: Toggle debug visualization")
-            print("H: Show heatmap")
-            print("Q: Quit")
-            
-            try:
-                while True:
-                    frame = cap.read()
-                    if frame is None:
-                        continue
-                    
-                    result = detect_faces(frame, face_cascade)
-                    if result:
-                        face_frame, face_pos = result
-                        detected_eye, direction = detect_eyes(face_frame, eye_cascade)
-                        
-                        if direction is not None:
-                            gaze_point = map_gaze_to_screen(direction, calibration_data, screen_width, screen_height)
-                            if gaze_point:
-                                gaze_points.append(gaze_point)
-                                cv2.circle(frame, gaze_point, 10, (0, 0, 255), -1)
-                    
-                    if debug_mode:
-                        # Show face and eye detection boxes
-                        cv2.putText(frame, "Debug Mode", (10, 30),
-                                  cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-                    
-                    cv2.imshow('Eye Tracking', frame)
-                    
-                    key = cv2.waitKey(1) & 0xFF
-                    if key == ord('q'):
-                        break
-                    elif key == ord('d'):
-                        debug_mode = not debug_mode
-                    elif key == ord('h') and gaze_points:
-                        generate_heatmap(gaze_points, screen_width, screen_height)
-            
-            except KeyboardInterrupt:
-                print("\nTracking interrupted by user.")
-            finally:
-                cap.stop()
-                cv2.destroyAllWindows()
-                
-                if gaze_points:
-                    print("\nGenerating final heatmap...")
-                    generate_heatmap(gaze_points, screen_width, screen_height)
-        
-        else:
-            print("\nCalibration failed or was cancelled.")
-    
+        live_tracking()
     elif choice == '2':
-        print("\nStatic image testing not implemented yet.")
-    
-    print("\nGoodbye!")
+        process_static_images()
+    elif choice == 'q':
+        print("\nGoodbye!")
+    else:
+        print("\nInvalid choice. Goodbye!")
 
 if __name__ == '__main__':
     main()
